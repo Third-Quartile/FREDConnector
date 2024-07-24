@@ -9,26 +9,19 @@ from fredapi import Fred
 from azure import identity
 import logging
 import time
-
 from dotenv import load_dotenv
+
+
 if os.path.exists('.env'):
-    load_dotenv('.env')
-    APIKEY = os.getenv("APIKEY")
-    SERVER = os.getenv("SERVER")
-    PORT = os.getenv("PORT")
-    if PORT:
-        SERVER += f",{PORT}"
-    DATABASE = os.getenv("DATABASE")
-    DB_USER = os.getenv("DB_USER")
-    PASSWORD = os.getenv("PASSWORD")
-    SYNC_MODE = os.getenv("SYNC_MODE")
-else:
-    APIKEY = os.environ["APIKEY"]
-    SERVER = os.environ["SERVER"]
-    DATABASE = os.environ["DATABASE"]
-    SYNC_MODE = os.environ["SYNC_MODE"]
-    DB_USER = os.environ["DB_USER"]
-    PASSWORD = os.environ["PASSWORD"]
+    load_dotenv('.env', override=True)
+
+APIKEY = os.getenv("APIKEY")
+SERVER = os.getenv("SERVER")
+DATABASE = os.getenv("DATABASE")
+DRIVER_VERSION = os.getenv("DRIVER_VERSION")
+SYNC_MODE = os.getenv("SYNC_MODE")
+DB_USER = os.getenv("DB_USER")
+PASSWORD = os.getenv("PASSWORD")
 
 TARGET_TABLE = "FinData"
 
@@ -61,14 +54,22 @@ SERIES_ID_LIST = [
     "BAMLC1A0C13YEY",
     "BAMLC3A0C57YEY",
     "BAMLCC4A0710YTRIV",
-    "BAMLC7A0C1015Y"
+    "BAMLC7A0C1015Y",
+    "FEDFUNDS",
+    "GDP",
+    "PAYEMS",
+    "CPIAUCSL",
+    "CORESTICKM159SFRBATL",
+    "SP500",
+    # "WILLSMLCAP",
+    "UNRATE"
 ]
 
 OBSERVATION_DATE  = datetime.now() - timedelta(days=1)
 
+
 def get_connection():
     """Return a connection to a SQL Server DB"""
-    driver_version = "{ODBC Driver 17 for SQL Server}"
 
     ########The commented code and connection_string are used to connect locally to the test enviroment
     #connection_string=f"""Driver={driver_version};Server=tcp:{SERVER};Database={DATABASE};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30"""
@@ -80,7 +81,7 @@ def get_connection():
     #conn = pyodbc.connect(connection_string, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
     ########
     
-    connection_string = f"Driver={driver_version};Server=tcp:{SERVER};Database={DATABASE};Uid={DB_USER};Pwd={PASSWORD};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30"
+    connection_string = f"Driver={DRIVER_VERSION};Server=tcp:{SERVER};Database={DATABASE};Uid={DB_USER};Pwd={PASSWORD};Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30"
     conn = pyodbc.connect(connection_string)
     
     return conn
@@ -91,13 +92,14 @@ def get_max_date(connection,target_table):
 
     with  connection.cursor() as cursor:
         cursor.execute(query)
-        #connection.commit()
+        # connection.commit()
         max_date = cursor.fetchval()
 
-    if max_date>(datetime.now() - timedelta(weeks=1)).date():
+    if not max_date:
+        return None
+    if max_date > (datetime.now() - timedelta(weeks=1)).date():
         return (datetime.now() - timedelta(weeks=1)).date()
-    else:
-        return max_date
+    return max_date
 
 
 def get_latest_data(connection,target_table):
@@ -105,7 +107,7 @@ def get_latest_data(connection,target_table):
 
     with  connection.cursor() as cursor:
         cursor.execute(query)
-        #connection.commit()
+        # connection.commit()
         rows  = cursor.fetchall()
         df_sql = pd.DataFrame.from_records(rows, columns=['DATE', 'API_CODE'])
     
@@ -117,21 +119,22 @@ def get_data_from_fred(series_id_list:list, max_date:datetime, df_sql:pd.DataFra
     fred = Fred(api_key=APIKEY)
     full_df = pd.DataFrame()
     for series_id in series_id_list:
-        if sync_mode=="full_load":
+        if sync_mode == "full_load":
             data_series = fred.get_series(series_id)
-        elif sync_mode=="incremental_load":
+        elif sync_mode == "incremental_load":
             data_series = fred.get_series(
                 series_id,
                 observation_start=max_date,
                 observation_end=observation_date.date()
             )
 
-        category_df = data_series.reset_index() #Here we extract the Date index as a new column
+        category_df = data_series.reset_index()  # Here we extract the Date index as a new column
         category_df.columns = ['DATE', 'VALUE']
         category_df["API_CODE"] = series_id
         full_df = pd.concat([full_df, category_df], axis=0)
 
-    full_df["ETL_LOADED_AT"] = datetime.now().date()
+    full_df["ETL_LOADED_AT"] = datetime.now()  # .date()
+    full_df['DATE'] = pd.to_datetime(full_df['DATE'])  # Ensure DATE is in datetime format
     full_df['DATE'] = full_df['DATE'].dt.date
     full_df = full_df.dropna(subset=['VALUE'])
 
@@ -148,8 +151,8 @@ def get_data_from_fred(series_id_list:list, max_date:datetime, df_sql:pd.DataFra
 
 
 def create_and_load_fin_master_table(connection:pyodbc.Connection) -> None:
-    """Create FinMaster table and insert data if the table does not exists"""
-    logging.info("\nStart creating table if not exists and loading data: FinMaster.")
+    """Create FinMaster table and insert data if the table does not exist"""
+    logging.info("Start creating table if not exists and loading data: FinMaster.")
     
     query = """
     IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'FinMaster')
@@ -194,14 +197,14 @@ def create_and_load_fin_master_table(connection:pyodbc.Connection) -> None:
     END;
     """
 
-    with  connection.cursor() as cursor:
+    with connection.cursor() as cursor:
         cursor.execute(query)
     connection.commit()
 
 
 def create_table_if_not_exists(target_table:str, connection:pyodbc.Connection) -> None:
     """Creates FinData table if not exists"""
-    logging.info(f"\nStart creating table if not exists: {target_table}.")
+    logging.info(f"Start creating table if not exists: {target_table}.")
 
     create_table_if_not_exists_query = f"""
     IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{target_table}')
@@ -211,36 +214,36 @@ def create_table_if_not_exists(target_table:str, connection:pyodbc.Connection) -
             DATE DATE,
             VALUE FLOAT,
             API_CODE NVARCHAR(255),
-            ETL_LOADED_AT DATE
+            ETL_LOADED_AT DATETIME
         )
     END;
     """
 
-    with  connection.cursor() as cursor:
+    with connection.cursor() as cursor:
         cursor.execute(create_table_if_not_exists_query)
     connection.commit()
 
 
 def truncate_table(target_table:str, connection:pyodbc.Connection) -> None:
     """Truncates FinData table when sync_mode=='full_load'"""
-    logging.info(f"\nStart truncating table: {target_table}.")
+    logging.info(f"Start truncating table: {target_table}.")
     
     truncate_table_query = f"""TRUNCATE TABLE {target_table}"""
 
-    with  connection.cursor() as cursor:
+    with connection.cursor() as cursor:
         cursor.execute(truncate_table_query)
     connection.commit()
 
 
 def insert_data(records:list[dict], connection:pyodbc.Connection, target_table:str) -> None:
     """Insert data into table FinData"""
-    logging.info(f"\nStart insertig data into temp table: {target_table}_Temp.")
+    logging.info(f"Start inserting data into temp table: {target_table}_Temp.")
 
     data = [(record['DATE'], record['VALUE'], record['API_CODE'], record['ETL_LOADED_AT']) for record in records]
     insert_query = f"INSERT INTO {target_table} (DATE, VALUE, API_CODE, ETL_LOADED_AT) VALUES (?, ?, ?, ?)"
 
     attempt = 1
-    while attempt<4:
+    while attempt < 4:
         try:
             with  connection.cursor() as cursor:
                 cursor.fast_executemany = True
@@ -256,12 +259,12 @@ def insert_data(records:list[dict], connection:pyodbc.Connection, target_table:s
 
 
 def fred_main() -> None:
-    """Extracts data from FRED API, creates tables if neccessary and inserts data into the tables"""
-
+    """Extracts data from FRED API, creates tables if necessary and inserts data into the tables"""
+    logging.basicConfig(level=logging.INFO)
     logging.info(f"OBSERVATION_DATE: {OBSERVATION_DATE}")
 
     attempt = 1
-    while attempt<4:
+    while attempt < 4:
         try:
             connection = get_connection()
             break
@@ -278,18 +281,18 @@ def fred_main() -> None:
 
     df_sql = get_latest_data(connection,TARGET_TABLE)
 
-    logging.info(f"start extraction from {str(max_date)}")
+    logging.info(f"Start extraction from {str(max_date)}")
 
     records = get_data_from_fred(SERIES_ID_LIST, max_date, df_sql, OBSERVATION_DATE, SYNC_MODE)
 
-    logging.info(f"\nData from fred retrieved: {len(records)} records.")
+    logging.info(f"Data from fred retrieved: {len(records)} records.")
     if len(records) > 0:
-
+    
         create_and_load_fin_master_table(connection)
-
-        if SYNC_MODE=="full_load":
+    
+        if SYNC_MODE == "full_load":
             truncate_table(TARGET_TABLE, connection)
-
+    
         chunk_size = 1000
         list_of_lists = [records[x:x+chunk_size] for x in range(0, len(records), chunk_size)]
         start_datetime = datetime.now()
